@@ -1,0 +1,286 @@
+/**
+ * ===================================================================================
+ * MB2_Importador – Metabase → Google Sheets (cards 1328 e 1317)
+ * Arquivo: MB2_Importador.gs
+ * -----------------------------------------------------------------------------------
+ * Criadores: Higor Piccirilli & GPT-5 Thinking (ChatGPT)
+ * Versão: v3.0.0  |  Data: 2025-11-01  |  TZ: America/Sao_Paulo
+ * -----------------------------------------------------------------------------------
+ * O que faz?
+ * - Login no Metabase
+ * - Busca JSON dos cards
+ * - Escreve/atualiza as abas alvo
+ *
+ * Integração LogRT (Only-Text Edition):
+ * - Modal dark 900x560, polling 1500ms, deduplicação, pausa de rolagem, exportar .txt
+ * - Cache por usuário: lanc_status_<execId>, TTL 6h, buffer 1000 linhas
+ * - Wrappers padronizados: [INICIANDO], [EM ANDAMENTO], [OK], [AVISO], [ERRO], [ERRO FATAL], resumo final
+ * ===================================================================================
+ */
+
+// -----------------------------------------------------------------
+// CREDENCIAIS (Script Properties; SEM senha em código)
+// -----------------------------------------------------------------
+var MB2_URL_BASE      = (PropertiesService.getScriptProperties().getProperty('MB_URL')         || '').trim();
+var MB2_USUARIO       = (PropertiesService.getScriptProperties().getProperty('MB_USER')        || '').trim();
+var MB2_SENHA         = (PropertiesService.getScriptProperties().getProperty('MB_PASSWORD')    || '').trim();
+var MB2_EMAIL_ALERTA  = (PropertiesService.getScriptProperties().getProperty('MB_ALERT_EMAIL') || '').trim();
+
+// -----------------------------------------------------------------
+// LISTA DE RELATÓRIOS / ABAS ALVO
+// -----------------------------------------------------------------
+var MB2_RELATORIOS = [
+  { cardId: 1328, nomeAba: '_CadastroProdutosBox' }, // A:M (cabeçalho linha 1, dados a partir da 2)
+  { cardId: 1317, nomeAba: '_BoxQuantidade' }        // A:D (cabeçalho linha 1, dados a partir da 2)
+];
+
+// -----------------------------------------------------------------
+// MENU (ordem solicitada)
+// ➊ Primeira: Atualizar TUDO (com Log)
+// ➋ Última : Atualizar TUDO (sem Log)
+// -----------------------------------------------------------------
+function MB2_onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Metabase (2)')
+      .addItem('Atualizar TUDO (com Log)', 'MB2_abrirLog_e_AtualizarTodos')
+      .addSeparator()
+      .addItem('Atualizar 1328 - Cadastro', 'MB2_atualizar1328')
+      .addItem('Atualizar 1317 - Quantidades', 'MB2_atualizar1317')
+      .addSeparator()
+      .addItem('Atualizar TUDO (sem Log)', 'MB2_atualizarTodos')
+    .addToUi();
+}
+
+// -----------------------------------------------------------------
+// ENTRADA COM LOG: abre modal e dispara a execução com execId
+// -----------------------------------------------------------------
+function MB2_abrirLog_e_AtualizarTodos() {
+  MB2_assertCredenciais();
+
+  var execId = MB2_newExecId_();
+  RT.clear(execId); // zera cache do execId antes de iniciar
+
+  // Empurra linha inicial conforme a especificação: [INICIANDO]
+  RT.iniciando(execId, 'Atualização Metabase (cards 1328 e 1317)');
+
+  // Prepara o HTML do modal de log (Only-Text Edition)
+  var t = HtmlService.createTemplateFromFile('RTLog');
+  t.title          = 'Log — Atualização Metabase';
+  t.execId         = execId;
+  t.serverFunction = 'MB2_atualizarTodos_comLog'; // será chamado automaticamente ao abrir (ver RTLog.html)
+  var html = t.evaluate().setWidth(900).setHeight(560);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Log em Tempo Real');
+}
+
+// -----------------------------------------------------------------
+// EXECUÇÃO COM LOG: segue wrappers padronizados, push por etapa
+// -----------------------------------------------------------------
+function MB2_atualizarTodos_comLog(execId) {
+  MB2_assertCredenciais();
+  execId = execId || MB2_newExecId_();
+
+  var ok = 0, fail = 0;
+
+  MB2_emit(execId, 'andamento', 'Verificando autenticação no Metabase...');
+  var token = MB2_loginMetabase_(2);
+  if (!token) {
+    MB2_emit(execId, 'erroFatal', 'Falha ao autenticar no Metabase (token vazio).');
+    throw new Error('Token vazio ao autenticar no Metabase.');
+  }
+  MB2_emit(execId, 'ok', 'Autenticação realizada.');
+
+  MB2_emit(execId, 'andamento', 'Iniciando atualização das abas-alvo...');
+
+  MB2_RELATORIOS.forEach(function(r) {
+    var etapa = 'Card ' + r.cardId + ' → ' + r.nomeAba;
+    try {
+      MB2_emit(execId, 'andamento', '[Consulta] ' + etapa);
+      var result = MB2_buscarDadosDoMetabase(token, r.cardId, r.nomeAba);
+
+      if (result && result.ok) {
+        MB2_emit(execId, 'ok', '[Escrita] ' + etapa + ' concluída (' + result.rows + ' linhas, ' + result.cols + ' colunas).');
+        ok++;
+      } else {
+        MB2_emit(execId, 'erro', 'Sem sucesso em ' + etapa + ' (retorno inválido).');
+        fail++;
+      }
+    } catch (e) {
+      fail++;
+      var msg = 'Erro em ' + etapa + ': ' + (e && e.message ? e.message : e);
+      MB2_emit(execId, 'erro', msg);
+      // best-effort alerta por e-mail
+      try { if (MB2_EMAIL_ALERTA) MailApp.sendEmail(MB2_EMAIL_ALERTA, '[ALERTA] MB2 falhou em ' + etapa, msg); } catch(_) {}
+    }
+  });
+
+  // Resumo Final (mensagem em destaque + ✅)
+  var resumo = '✅ Concluído — Sucesso: ' + ok + ' · Falhas: ' + fail;
+  MB2_emit(execId, 'final', resumo);
+  SpreadsheetApp.getActive().toast(resumo);
+}
+
+// -----------------------------------------------------------------
+// AÇÕES SEM LOG (rápidas)
+// -----------------------------------------------------------------
+function MB2_atualizarTodos() {
+  MB2_assertCredenciais();
+  var ok = 0, fail = 0;
+  var token = MB2_loginMetabase_(2);
+  if (!token) throw new Error('Falha ao autenticar no Metabase.');
+
+  MB2_RELATORIOS.forEach(function(r) {
+    var result = MB2_buscarDadosDoMetabase(token, r.cardId, r.nomeAba);
+    result && result.ok ? ok++ : fail++;
+  });
+
+  SpreadsheetApp.getActive().toast('Concluído — Sucesso: ' + ok + ' · Falhas: ' + fail);
+}
+
+function MB2_atualizar1328() {
+  MB2_assertCredenciais();
+  var token = MB2_loginMetabase_(2);
+  var r = MB2_RELATORIOS.find(function(x){ return x.cardId === 1328; });
+  if (!r) return;
+  var result = MB2_buscarDadosDoMetabase(token, r.cardId, r.nomeAba);
+  SpreadsheetApp.getActive().toast(result && result.ok ? '1328 atualizado!' : 'ERRO ao atualizar 1328');
+}
+
+function MB2_atualizar1317() {
+  MB2_assertCredenciais();
+  var token = MB2_loginMetabase_(2);
+  var r = MB2_RELATORIOS.find(function(x){ return x.cardId === 1317; });
+  if (!r) return;
+  var result = MB2_buscarDadosDoMetabase(token, r.cardId, r.nomeAba);
+  SpreadsheetApp.getActive().toast(result && result.ok ? '1317 atualizado!' : 'ERRO ao atualizar 1317');
+}
+
+// -----------------------------------------------------------------
+// CORE – Consulta Metabase e escreve na aba (retorna {ok, rows, cols})
+// -----------------------------------------------------------------
+function MB2_buscarDadosDoMetabase(sessionToken, cardId, nomeDaAba) {
+  // 1) Query
+  var queryOptions = {
+    method: 'post',
+    headers: { 'X-Metabase-Session': sessionToken },
+    contentType: 'application/json',
+    muteHttpExceptions: true
+  };
+  var url = MB2_URL_BASE + '/api/card/' + cardId + '/query/json';
+  var queryResp = UrlFetchApp.fetch(url, queryOptions);
+  MB2_throwIfHttpError_(queryResp, 'Falha ao consultar card ' + cardId);
+
+  var text = queryResp.getContentText() || '[]';
+  var dados;
+  try {
+    dados = JSON.parse(text);
+  } catch (e) {
+    throw new Error('JSON inválido (card ' + cardId + '): ' + (e && e.message ? e.message : e));
+  }
+
+  // 2) Preparar planilha/aba
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(nomeDaAba) || ss.insertSheet(nomeDaAba);
+  sheet.clearContents();
+
+  // 3) Escrever
+  if (!dados || !dados.length) {
+    sheet.getRange(1, 1).setValue('Nenhum dado retornado do Metabase (Card ' + cardId + ')');
+    sheet.autoResizeColumns(1, 1);
+    SpreadsheetApp.flush();
+    return { ok: true, rows: 0, cols: 1 };
+  }
+
+  var headers = Object.keys(dados[0]);
+  var valores = [headers];
+  dados.forEach(function(linha) {
+    var arr = headers.map(function(h) {
+      var v = linha[h];
+      return (v === null || v === undefined) ? '' : v;
+    });
+    valores.push(arr);
+  });
+
+  sheet.getRange(1, 1, valores.length, headers.length).setValues(valores);
+  sheet.autoResizeColumns(1, headers.length);
+  SpreadsheetApp.flush();
+
+  return { ok: true, rows: dados.length, cols: headers.length };
+}
+
+// -----------------------------------------------------------------
+// LOGIN (retry simples)
+// -----------------------------------------------------------------
+function MB2_loginMetabase_(tentativas) {
+  tentativas = Math.max(1, parseInt(tentativas || 1, 10));
+  var lastErr;
+
+  for (var i = 1; i <= tentativas; i++) {
+    try {
+      var loginOptions = {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({ username: MB2_USUARIO, password: MB2_SENHA }),
+        muteHttpExceptions: true
+      };
+      var resp = UrlFetchApp.fetch(MB2_URL_BASE + '/api/session', loginOptions);
+      MB2_throwIfHttpError_(resp, 'Falha ao autenticar no Metabase');
+      var token = JSON.parse(resp.getContentText()).id;
+      if (!token) throw new Error('Token não retornado pelo Metabase.');
+      return token;
+    } catch (e) {
+      lastErr = e;
+      Utilities.sleep(500);
+    }
+  }
+  throw new Error('Não foi possível autenticar no Metabase. Último erro: ' + (lastErr && lastErr.message));
+}
+
+// -----------------------------------------------------------------
+// UTILITÁRIAS
+// -----------------------------------------------------------------
+function MB2_throwIfHttpError_(resp, context) {
+  var code = resp && resp.getResponseCode ? resp.getResponseCode() : 0;
+  if (code >= 400) {
+    var body = '';
+    try { body = resp.getContentText(); } catch (_) {}
+    throw new Error((context || 'HTTP Error') + ' | Código ' + code + (body ? ' | Corpo: ' + body : ''));
+  }
+}
+
+function MB2_assertCredenciais() {
+  var faltando = [];
+  if (!MB2_URL_BASE) faltando.push('MB_URL');
+  if (!MB2_USUARIO)  faltando.push('MB_USER');
+  if (!MB2_SENHA)    faltando.push('MB_PASSWORD');
+  if (!MB2_EMAIL_ALERTA) Logger.log('Aviso: MB_ALERT_EMAIL não configurado (sem e-mail de alerta).');
+  if (faltando.length) throw new Error('Propriedades ausentes: ' + faltando.join(', ') + '. Defina em File → Project properties → Script properties.');
+}
+
+function MB2_newExecId_() {
+  return 'MB2-' + new Date().getTime() + '-' + Math.floor(Math.random() * 1000);
+}
+
+
+/**
+ * Emissor que respeita execId: se existir, usa wrappers RT; senão, só Logger.
+ */
+function MB2_emit(execId, nivel, mensagem) {
+  if (execId) {
+    try {
+      switch (String(nivel)) {
+        case 'iniciando':  RT.iniciando(execId, mensagem); break;
+        case 'andamento':  RT.andamento(execId, mensagem); break;
+        case 'ok':         RT.ok(execId, mensagem); break;
+        case 'aviso':      RT.aviso(execId, mensagem); break;
+        case 'erro':       RT.erro(execId, mensagem); break;
+        case 'erroFatal':  RT.erroFatal(execId, mensagem); break;
+        case 'final':      RT.final(execId, mensagem); break;
+        default:           RT.andamento(execId, mensagem); break;
+      }
+    } catch (_) {
+      Logger.log('MB2 | ' + mensagem);
+    }
+  } else {
+    Logger.log('MB2 | ' + mensagem);
+  }
+}
