@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8" />
+  <style>
+    :root {
+      --bg: #1e1e1e;       /* Fundo escuro */
+      --text: #e0e0e0;     /* Texto claro suave */
+      
+      /* Cores ajustadas */
+      --ok: #4caf50;       /* Verde padrão (material design) */
+      --err: #ef5350;      /* Vermelho suave */
+      --info: #64b5f6;     /* Azul claro */
+      --final: #66bb6a;    /* Verde levemente mais claro para destaque final */
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Consolas", "Monaco", "Courier New", monospace;
+      font-size: 15px; /* AUMENTADO conforme pedido */
+      overflow: hidden;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .log-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .line {
+      display: flex;
+      gap: 15px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border-bottom: 1px solid rgba(255,255,255,0.05); /* Separador sutil */
+      padding-bottom: 2px;
+    }
+    .ts {
+      color: #757575; /* Cinza mais escuro para a hora não chamar atenção */
+      min-width: 70px;
+      font-size: 0.9em;
+      user-select: none;
+    }
+    .msg { flex: 1; }
+    
+    /* Classes baseadas no 'level' enviado pelo LogRT.gs */
+    .type-ok { color: var(--ok); font-weight: bold; }
+    .type-error { color: var(--err); font-weight: bold; }
+    .type-warn { color: #ffca28; }
+    .type-info { color: var(--text); }
+    
+    /* Estilo do Resumo Final */
+    .type-final { 
+      color: var(--final); 
+      font-weight: bold; 
+      font-size: 1.1em; /* Um pouco maior */
+      margin-top: 15px; 
+      padding-top: 15px;
+      border-top: 1px solid #444;
+      border-bottom: none;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="log" class="log-container" role="log"></div>
+
+  <script>
+    const execId   = '<?= execId ?>';
+    const serverFn = '<?= serverFunction ?>';
+    const logBox   = document.getElementById('log');
+    
+    let intervalMs = 1000;
+    let running    = true;
+    let lastKey    = null;
+
+    // --- Renderização ---
+    function appendLine(line) {
+      if (!line) return;
+      
+      // Evita duplicar a mesma linha se o servidor mandar de novo
+      const uniqueKey = line.ts + line.text;
+      if (lastKey === uniqueKey) return;
+      lastKey = uniqueKey;
+
+      const div = document.createElement('div');
+      
+      // Define a cor baseada no NÍVEL (level) enviado pelo servidor, e não no texto
+      // Isso corrige o problema do "Falhas: 0" ficar vermelho
+      let cssClass = 'type-info';
+      if (line.level === 'ok') cssClass = 'type-ok';
+      else if (line.level === 'error') cssClass = 'type-error';
+      else if (line.level === 'warn') cssClass = 'type-warn';
+      else if (line.level === 'final') cssClass = 'type-final';
+
+      div.className = 'line';
+      div.innerHTML = `
+        <span class="ts">${line.ts}</span>
+        <span class="msg ${cssClass}">${line.text}</span>
+      `;
+
+      logBox.appendChild(div);
+      logBox.scrollTop = logBox.scrollHeight; // Rola para baixo
+    }
+
+    // --- Polling ---
+    function tick() {
+      if (!running) return;
+      google.script.run
+        .withSuccessHandler(({line}) => {
+          if (line) appendLine(line);
+          setTimeout(tick, intervalMs);
+        })
+        .withFailureHandler(() => {
+          setTimeout(tick, intervalMs * 2);
+        })
+        .RT_fetchLast(execId);
+    }
+
+    // --- Início ---
+    (function init() {
+      tick(); // Começa a ouvir
+      if (serverFn) {
+        google.script.run.withFailureHandler(err => {
+            appendLine({ts: '-', level: 'error', text: 'Falha crítica: ' + err});
+        })[serverFn](execId);
+      }
+    })();
+  </script>
+</body>
+</html>
